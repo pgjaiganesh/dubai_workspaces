@@ -1,0 +1,15 @@
+{
+    "rules": [
+         {
+            "definition": {
+                "path": [
+                    {"prefix": "stream/"}
+                ],
+                "days_since_create": [
+                    {"numeric": [">" , 1]}
+                ]
+            },
+            "action": "EXPIRE"
+        }
+    ]
+}

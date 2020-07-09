@@ -1,0 +1,498 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: (ME0010) VOD Ingest - the solution is designed to demonstrate a serverless vod ingest workflow with AWS Elemental MediaConvert and MediaPackageVOD services.
+
+#
+# Mappings to store static value of the solution
+#
+Mappings:
+    Solution:
+        Project:
+            Id: ME0010
+        Template:
+            S3Bucket: "mediaent-solution"
+            KeyPrefix: "vod-ingest/v0.0.1"
+        Package:
+            CustomResourceX: "custom-resources_v0.0.1.zip"
+        Layer:
+            AwsSdk: "aws-sdk-layer_v2.496.0.zip"
+        SNS:
+            DisplayName: VODStatus
+    StepFunctions:
+        StateMachine:
+            WaitIntervalInSec: 10
+
+Parameters:
+    # MediaPackageVod
+    Endpoints:
+        Type: CommaDelimitedList
+        Description: "comma delimited list. ie., HLS,DASH,MSS"
+        Default: "HLS,DASH"
+        AllowedValues:
+            - HLS
+            - HLS,DASH
+            - HLS,MSS
+            - HLS,DASH,MSS
+            - HLS,DASH,MSS,CMAF
+            - DASH
+            - DASH,MSS
+            - DASH,MSS,CMAF
+            - MSS
+            - MSS,CMAF
+            - CMAF
+    SegmentLength:
+        Type: Number
+        Description: specify segment length in seconds.
+        Default: 10
+        MinValue: 2
+        MaxValue: 600
+
+    # SNS parameter
+    Email:
+        Type: String
+        Description: Email address of the user that is subscribed to the Amazon SNS topic. Subscribed users will receive ingest, publishing, and error notifications.
+        AllowedPattern: '[^\s@]+@[^\s@]+\.[^\s@]+'
+
+Metadata:
+    AWS::CloudFormation::Interface:
+        ParameterGroups:
+            -
+                Label:
+                    default: "AWS Elemental MediaPackage Configuration"
+                Parameters:
+                    - Endpoints
+                    - SegmentLength
+            -
+                Label:
+                    default: "Amazon SNS Configuration"
+                Parameters:
+                    - Email
+
+        ParameterLabels:
+            Endpoints:
+                default: Packaging Type(s)
+            Email:
+                default: Email
+
+Conditions:
+    bEmail: !Not [
+        !Equals [
+            !Ref Email,
+            ""
+        ]
+    ]
+    bUSEast1: !Equals [
+        !Ref "AWS::Region",
+        "us-east-1"
+    ]
+
+Resources:
+    ################################################################################
+    #
+    # Create custom resource lambda
+    #
+    ################################################################################
+    #
+    # allow accesses for custom resource lambda
+    #
+    CustomResourceExecutionRole:
+        Type: AWS::IAM::Role
+        Metadata:
+            cfn_nag:
+                rules_to_suppress:
+                    -
+                        id: W11
+                        reason: "This wildcard is present as the custom resource lambda needs to be able to access contents within the bucket!"
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: "Allow"
+                        Action: ["sts:AssumeRole"]
+                        Principal:
+                            Service: ["lambda.amazonaws.com"]
+            Path: /
+            Policies:
+                -
+                    PolicyName: !Sub ["${x0}-${AWS::StackName}-custom-resources", {x0: !FindInMap ["Solution", "Project", "Id"]}]
+                    PolicyDocument:
+                        Version: "2012-10-17"
+                        Statement:
+                        ## S3
+                        -
+                            Effect: "Allow"
+                            Action: [
+                                "s3:DeleteObject",
+                                "s3:GetAccelerateConfiguration",
+                                "s3:GetBucketCORS",
+                                "s3:GetBucketNotification",
+                                "s3:GetBucketPolicy",
+                                "s3:GetBucketTagging",
+                                "s3:GetEncryptionConfiguration",
+                                "s3:GetLifecycleConfiguration",
+                                "s3:GetObject",
+                                "s3:GetObjectAcl",
+                                "s3:GetObjectTagging",
+                                "s3:ListBucket",
+                                "s3:PutAccelerateConfiguration",
+                                "s3:PutBucketCORS",
+                                "s3:PutBucketNotification",
+                                "s3:PutBucketPolicy",
+                                "s3:PutBucketTagging",
+                                "s3:PutEncryptionConfiguration",
+                                "s3:PutLifecycleConfiguration",
+                                "s3:PutObject",
+                                "s3:PutObjectAcl",
+                                "s3:PutObjectTagging"
+                            ]
+                            # This wildcard is present because of circular dependency where
+                            # the buckets aren't known before this custom resource lambda function
+                            # is created.
+                            Resource: [
+                                !Sub "arn:aws:s3:::*",
+                                !Sub "arn:aws:s3:::*/*"
+                            ]
+
+                        ## S3.GetBucketLoction to check bucket availability
+                        -
+                            Effect: "Allow"
+                            Action: [
+                                "s3:ListAllMyBuckets",
+                                "s3:GetBucketLocation"
+                            ]
+                            # This wildcard is present as we need access to check bucket
+                            # availability
+                            Resource: [
+                                !Sub "arn:aws:s3:::*"
+                            ]
+
+                        ## MediaConvert
+                        -
+                            Effect: "Allow"
+                            Action: [
+                                "mediaConvert:DescribeEndpoints",
+                            ]
+                            # This wildcard is present because the MediaConvert job
+                            # IDs are randomly generated.
+                            Resource: [
+                                !Sub "arn:aws:mediaconvert:${AWS::Region}:${AWS::AccountId}:*"
+                            ]
+
+                        ## MediaPackageVOD
+                        -
+                            Effect: "Allow"
+                            Action: [
+                                "mediapackage-vod:CreateAsset",
+                                "mediapackage-vod:CreatePackagingConfiguration",
+                                "mediapackage-vod:CreatePackagingGroup",
+                                "mediapackage-vod:DeleteAsset",
+                                "mediapackage-vod:DeletePackagingConfiguration",
+                                "mediapackage-vod:DeletePackagingGroup",
+                                "mediapackage-vod:DescribeAsset",
+                                "mediapackage-vod:DescribePackagingConfiguration",
+                                "mediapackage-vod:DescribePackagingGroup",
+                                "mediapackage-vod:ListAssets",
+                                "mediapackage-vod:ListPackagingConfigurations",
+                                "mediapackage-vod:ListPackagingGroups",
+                            ]
+                            # This wildcard is present because the MediaPackageVOD
+                            # IDs are randomly generated.
+                            Resource: [
+                                !Sub "arn:aws:mediapackage-vod:${AWS::Region}:${AWS::AccountId}:*"
+                            ]
+
+                        ## CloudWatch Logs
+                        -
+                            Effect: "Allow"
+                            Action: [
+                                "logs:CreateLogGroup",
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents"
+                            ]
+                            Resource: [
+                                !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                            ]
+
+                        ## SNS
+                        -
+                            Effect: "Allow"
+                            Action: [
+                                "sns:GetSubscriptionAttributes",
+                                "sns:GetTopicAttributes",
+                                "sns:ListSubscriptionsByTopic",
+                                "sns:ListTopics",
+                                "sns:SetSubscriptionAttributes",
+                                "sns:SetTopicAttributes",
+                                "sns:Subscribe",
+                                "sns:Unsubscribe"
+                            ]
+                            # This wildcard is present because the SNS topic is not known
+                            # before this custom resource lambda function is created.
+                            Resource: [
+                                !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*"
+                            ]
+
+    #
+    # cusotm resource lambda function to help custom actions
+    #
+    CustomResourceFunction:
+        Type: AWS::Lambda::Function
+        Properties:
+            Description: !Sub ["(${x0}) custom resources", {x0: !FindInMap ["Solution", "Project", "Id"]}]
+            Runtime: nodejs8.10
+            MemorySize: "128"
+            Timeout: "300"
+            Handler: index.Run
+            Role: !GetAtt CustomResourceExecutionRole.Arn
+            Code:
+                S3Bucket: !Sub [ "${x0}-${AWS::Region}",{
+                    x0: !FindInMap ["Solution", "Template", "S3Bucket"]
+                }]
+                S3Key: !Sub [ "${x0}/${x1}", {
+                    x0: !FindInMap ["Solution", "Template", "KeyPrefix"],
+                    x1: !FindInMap ["Solution", "Package", "CustomResourceX"]
+                }]
+
+    ################################################################################
+    #
+    # Sanitized stack name first, convert 
+    #
+    ################################################################################
+    SanitizedStackName:
+        Type: Custom::SantizedStackName
+        Properties:
+            ServiceToken: !GetAtt CustomResourceFunction.Arn
+            FunctionName: StringManipulation
+            InputString: !Ref AWS::StackName
+            Operations: "alphanumeric,lower,maxlen=64"
+
+    ################################################################################
+    #
+    # Lambda layers
+    #
+    ################################################################################
+    #
+    # latest AWS SDK layer
+    #
+    AwsSdkLayer:
+        Type: AWS::Lambda::LayerVersion
+        Properties:
+            LayerName: !Sub [
+                "${x0}-${SanitizedStackName.OutputString}-aws-sdk-layer", {
+                    x0: !FindInMap ["Solution", "Project", "Id"]
+                }
+            ]
+            CompatibleRuntimes:
+                - nodejs8.10
+            Content:
+                S3Bucket: !Sub [
+                    "${x0}-${AWS::Region}", {
+                        x0: !FindInMap ["Solution", "Template", "S3Bucket"]
+                    }
+                ]
+                S3Key: !Sub [
+                    "${x0}/${x1}", {
+                        x0: !FindInMap ["Solution", "Template", "KeyPrefix"],
+                        x1: !FindInMap ["Solution", "Layer", "AwsSdk"]
+                    }
+                ]
+            Description: !Sub [
+                "${x0} ${AWS::StackName} aws-sdk layer", {
+                    x0: !FindInMap ["Solution", "Project", "Id"]
+                }
+            ]
+            LicenseInfo: Apache-2.0
+
+    #
+    # call MediaConvert describeEndpoint
+    #
+    MediaConvertUrl:
+        Type: Custom::MediaConvertUrl
+        Properties:
+            ServiceToken: !GetAtt CustomResourceFunction.Arn
+            FunctionName: MediaConvertEndpoint
+
+    #
+    # Create MediaPackage Vod Package group
+    #
+    CreateMediaPackageGroup:
+        Type: Custom::CreateMediaPackageGroup
+        Properties:
+            ServiceToken: !GetAtt CustomResourceFunction.Arn
+            SolutionId: !FindInMap ["Solution", "Project", "Id"]
+            StackName: !GetAtt SanitizedStackName.OutputString
+            FunctionName: CreateMediaPackageGroup
+            PackageGroupName: !Sub "${RandomizeBucketName.OutputString}-vod-package"
+            Endpoints: !Join [ ",", !Ref Endpoints ]
+            SegmentLength: !Ref SegmentLength
+
+    ################################################################################
+    #
+    # S3/Glacier related resources
+    #
+    ################################################################################
+    #
+    # Generate a unique name for the media analysis bucket
+    #
+    RandomizeBucketName:
+      Type: Custom::RandomizeBucketName
+      Properties:
+        ServiceToken: !GetAtt CustomResourceFunction.Arn
+        FunctionName: StringManipulation
+        InputString: !Sub [
+            "${x0}-${SanitizedStackName.OutputString}",
+            { x0: !FindInMap ["Solution", "Project", "Id"] }
+        ]
+        Operations: "lower,minlen=3,maxlen=63,dash,random=12"
+
+    #
+    # create Ingest/Proxy bucket stack
+    #
+    BucketStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub [
+                "https://${x0}-${AWS::Region}.s3.amazonaws.com/${x1}/vod-ingest-bucket-stack.template",
+                {
+                    x0: !FindInMap ["Solution", "Template", "S3Bucket"],
+                    x1: !FindInMap ["Solution", "Template", "KeyPrefix"]
+                }
+            ]
+            Parameters:
+                S3Bucket: !Sub [
+                    "${x0}-${AWS::Region}",
+                    {
+                        x0: !FindInMap ["Solution", "Template", "S3Bucket"]
+                    }
+                ]
+                KeyPrefix: !FindInMap ["Solution", "Template", "KeyPrefix"]
+                SolutionId: !FindInMap ["Solution", "Project", "Id"]
+                RootStackName: !GetAtt SanitizedStackName.OutputString
+                IngestBucket: !Sub "${RandomizeBucketName.OutputString}-ingest"
+                ProxyBucket: !Sub "${RandomizeBucketName.OutputString}-proxy"
+                StateMachineName: !Sub "${RandomizeBucketName.OutputString}-ingest"
+                CustomResourceArn: !GetAtt CustomResourceFunction.Arn
+                SNSTopicArn: !Ref SNSNotificationTopic
+                AwsSdkLayer: !Ref AwsSdkLayer
+
+    ################################################################################
+    #
+    # Step Functions/state machine lambda related resources
+    #
+    ################################################################################
+    #
+    # create ingest & metadata state machines stack
+    #
+    StateMachinesStack:
+        Type: AWS::CloudFormation::Stack
+        Properties:
+            TemplateURL: !Sub [
+                "https://${x0}-${AWS::Region}.s3.amazonaws.com/${x1}/vod-ingest-state-machine-stack.template",
+                {
+                    x0: !FindInMap ["Solution", "Template", "S3Bucket"],
+                    x1: !FindInMap ["Solution", "Template", "KeyPrefix"]
+                }
+            ]
+            Parameters:
+                S3Bucket: !Sub [ "${x0}-${AWS::Region}", {
+                    x0: !FindInMap ["Solution", "Template", "S3Bucket"]
+                }]
+                KeyPrefix: !FindInMap ["Solution", "Template", "KeyPrefix"]
+                SolutionId: !FindInMap ["Solution", "Project", "Id"]
+                RootStackName: !GetAtt SanitizedStackName.OutputString
+                StateMachineName: !Sub "${RandomizeBucketName.OutputString}-ingest"
+                IngestBucket: !GetAtt BucketStack.Outputs.IngestBucketName
+                ProxyBucket: !GetAtt BucketStack.Outputs.ProxyBucketName
+                MediaConvertEndpoint: !GetAtt MediaConvertUrl.Endpoint
+                MediaPackageVodGroupId: !GetAtt CreateMediaPackageGroup.Id
+                SNSTopicArn: !Ref SNSNotificationTopic
+                WaitIntervalInSec: !FindInMap ["StepFunctions", "StateMachine", "WaitIntervalInSec"]
+                AwsSdkLayer: !Ref AwsSdkLayer
+
+    ################################################################################
+    #
+    # SNS related resources
+    #
+    ################################################################################
+    #
+    # create sns topic / notification
+    #
+    SNSNotificationTopic:
+        Type: AWS::SNS::Topic
+        Properties:
+            TopicName: !Sub [
+                "${x0}-${SanitizedStackName.OutputString}",
+                {
+                    x0: !FindInMap ["Solution", "Project", "Id"]
+                }
+            ]
+            DisplayName: !FindInMap ["Solution", "SNS", "DisplayName"]
+
+    ## run EmailSubscribe to subscribe emails to SNS topic
+    EmailSubscribeFunction:
+        DependsOn: [
+            BucketStack,
+            StateMachinesStack
+        ]
+        Condition: bEmail
+        Type: Custom::EmailSubscribe
+        Properties:
+            ServiceToken: !GetAtt CustomResourceFunction.Arn
+            FunctionName: EmailSubscribe
+            EmailList: !Ref Email
+            TopicArn: !Ref SNSNotificationTopic
+
+Outputs:
+    ## Layers
+    AwsSdkLayerArn:
+        Value: !Ref AwsSdkLayer
+        Description: Lambda Layer (AWS SDK)
+
+    ## Custom Resource related
+    CustomResourceExecutionRoleArn:
+        Value: !GetAtt CustomResourceExecutionRole.Arn
+        Description: Role Arn (Custom Resource)
+    CustomResourceName:
+        Value: !Ref CustomResourceFunction
+        Description: Lambda Name (Custom Resource)
+    CustomResourceArn:
+        Value: !GetAtt CustomResourceFunction.Arn
+        Description: Lambda Arn (Custom Resource)
+
+    ## S3 Buckets
+    IngestBucket:
+        Value: !GetAtt BucketStack.Outputs.IngestBucketName
+        Description: Bucket (Ingest)
+
+    ProxyBucket:
+        Value: !GetAtt BucketStack.Outputs.ProxyBucketName
+        Description: Bucket (Proxy)
+
+    ## SNS related
+    SNSTopicName:
+        Value: !GetAtt SNSNotificationTopic.TopicName
+        Description: Topic Name (SNS)
+    SNSTopicArn:
+        Value: !Ref SNSNotificationTopic
+        Description: Topic Arn (SNS)
+
+    ## State machine related
+    MediaConvertRoleArn:
+        Value: !GetAtt StateMachinesStack.Outputs.MediaConvertRoleArn
+        Description: Role Arn (VodIngest MediaConvert Service)
+    MediaPackageVodRoleArn:
+        Value: !GetAtt StateMachinesStack.Outputs.MediaPackageVodRoleArn
+        Description: Role Arn (VodIngest MediaPackageVod Service)
+    VodIngestStateMachineExecutionRoleArn:
+        Value: !GetAtt StateMachinesStack.Outputs.ExecutionRoleArn
+        Description: Role Arn (VodIngest State Machine Execution)
+    VodIngestStateMachineServiceRoleArn:
+        Value: !GetAtt StateMachinesStack.Outputs.ServiceRoleArn
+        Description: Role Arn (VodIngest State Machine Service)
+    VodIngestIngestStateMachineArn:
+        Value: !GetAtt StateMachinesStack.Outputs.IngestStateMachineArn
+        Description: State Machine Arn (VodIngest Ingest)
+    VodIngestIngestStateMachineName:
+        Value: !GetAtt StateMachinesStack.Outputs.IngestStateMachineName
+        Description: State Machine Name (VodIngest Ingest)

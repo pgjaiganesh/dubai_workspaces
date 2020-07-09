@@ -1,0 +1,22 @@
+{
+  "containerDefinitions": [
+    {
+      "name": "nginx",
+      "image": "444603092185.dkr.ecr.us-east-1.amazonaws.com/nginx:rev1",
+      "memory": "256",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": "8000",
+          "protocol": "tcp"
+        }
+      ]
+    }
+  ],
+  "volumes": [],
+  "networkMode": "bridge",
+  "placementConstraints": [],
+  "family": "nginx"
+}
+
+docker run --name docker-nginx -p 80:80 -d -v ~/srv:/usr/share/nginx/html nginx
